@@ -1,0 +1,10 @@
+17a4506f52f782653fac7f4ea4531d60 *DESCRIPTION
+2cab78031cb402ca9163e820fd045158 *NAMESPACE
+e9a58bc9830ea57fff2f9e44dbe9911d *NEWS.md
+9c07e911de0c56967b7023d8398d3776 *R/data.R
+7ff99ba7412142ca5c5b76054d4e048e *R/lambdaTS.R
+895fcd25d77f1566cf906466894ec5e3 *R/main.R
+31eeb90a0f8e79312ace7219bd3e7c0d *R/support.R
+d64a6b5990bf550da21666c1a97af4d7 *data/bitcoin_gold_oil.rda
+20fc63b25877f384ffc57f2e96f04145 *man/bitcoin_gold_oil.Rd
+ebada0aa3e731193c52e3e38a630315f *man/lambdaTS.Rd
