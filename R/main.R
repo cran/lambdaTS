@@ -7,18 +7,18 @@
 #' @param ci Confidence interval. Default: 0.8
 #' @param deriv Positive integer. Number of differentiation operations to perform on the original series. 0 = no change; 1: one diff; 2: two diff, and so on.
 #' @param yjt Logical. Performing Yeo-Johnson Transformation on data is always advisable, especially when dealing with different ts at different scales. Default: TRUE
-#' @param shift Vector of positive integers. Allow for target variables to shift ahead of time. Zero means no shift. Length must be equal to the number of targets.
+#' @param shift Vector of positive integers. Allow for target variables to shift ahead of time. Zero means no shift. Length must be equal to the number of targets. Default: 0.
 #' @param smoother Logical. Perform optimal smooting using standard loess. Default: FALSE
 #' @param k_embed Positive integer. Number of Time2Vec embedding dimensions. Minimum value is 2. Default: 30
 #' @param r_proj Positive integer. Number of dimensions for the reduction space (to reduce quadratic complexity). Must be largely less than k_embed size. Default: ceiling(k_embed/3) + 1
 #' @param n_heads Positive integer. Number of heads for the attention mechanism. Computationally expensive, use with care. Default: 1
-#' @param n_bases Positive integer. Number of normal curves to build on each parameter. WIth more than one base you can model be Default: 1
+#' @param n_bases Positive integer. Number of normal curves to build on each parameter. Computationally expensive, use with care. Default: 1
 #' @param activ String. The activation function for the linear transformation of the attention matrix into the future sequence. Implemented options are: "linear", "leaky_relu", "celu", "elu", "gelu", "selu", "softplus", "bent", "snake", "softmax", "softmin", "softsign", "sigmoid", "tanh", "tanhshrink", "swish", "hardtanh", "mish". Default: "linear".
 #' @param loss_metric String. Loss function for the variational model. Two options: "elbo" or "crps". Default: "crps".
 #' @param optim String. Optimization methods available are: "adadelta", "adagrad", "rmsprop", "rprop", "sgd", "asgd", "adam". Default: "adam".
 #' @param epochs Positive integer. Default: 30.
 #' @param lr Positive numeric. Learning rate. Default: 0.01.
-#' @param patience Positive integer. Waiting time (in epochs) before evaluating the overfit performance.
+#' @param patience Positive integer. Waiting time (in epochs) before evaluating the overfit performance. Default: epochs.
 #' @param verbose Logical. Default: TRUE
 #' @param sample_n Positive integer. Number of samples from the variational model to evalute the mean forecast values. Computationally expensive, use with care. Default: 100.
 #' @param seed Random seed. Default: 42.
@@ -37,9 +37,9 @@
 #' \item prediction: a table with quantile predictions, mean and std for each ts
 #' \item history: plot of loss during the training process for the joint-transformed ts
 #' \item plot: graph with history and prediction for each ts
-#' \item learning_error: errors for the joint-transformed ts (rmse, mae, mdae, mpe, mape, smape, rrse, rae)
-#' \item feature_errors: errors for each ts (rmse, mae, mdae, mpe, mape, smape, rrse, rae)
-#' \item pred_stats: some stats on predicted ts (average iqr, iqr ratio t/1, approx upside probability)
+#' \item learning_error: errors for the joint-ts in the transformed scale (rmse, mae, mdae, mpe, mape, smape, rrse, rae)
+#' \item feature_errors: errors for each ts in the original scale (rmse, mae, mdae, mpe, mape, smape, rrse, rae)
+#' \item pred_stats: for each predicted time feature, IQR to range, KL-divergence, risk ratio, upside probability, averaged across time-points and compared at the terminal points.
 #' \item time_log
 #' }
 #'
@@ -47,7 +47,6 @@
 #'
 #' @importFrom fANCOVA loess.as
 #' @importFrom imputeTS na_kalman
-#' @importFrom bestNormalize yeojohnson
 #' @importFrom modeest mlv1
 #' @import purrr
 #' @import abind
@@ -65,7 +64,7 @@
 #'
 #'@examples
 #'\dontrun{
-#'lambdaTS(bitcoin_gold_oil, c("bitcoin_Close", "gold_close", "oil_Close"), 30, 30, deriv = 2)
+#'lambdaTS(bitcoin_gold_oil, c("gold_close", "oil_Close"), 30, deriv = 1)
 #'}
 #'
 lambdaTS <- function(data, target, future, past = future, ci = 0.8, deriv = 1, yjt = TRUE, shift = 0, smoother = FALSE,
@@ -93,11 +92,11 @@ lambdaTS <- function(data, target, future, past = future, ci = 0.8, deriv = 1, y
 
   data <- data[, target, drop = FALSE]
   n_feat <- ncol(data)
-  n_length <- nrow(data)
 
   ###MISSING IMPUTATION
   if(anyNA(data) & is.null(days_off)){data <- as.data.frame(map(data, ~ na_kalman(.x))); message("kalman imputation\n")}
   if(anyNA(data) & !is.null(days_off)){data <- na.omit(data); message("omitting missings\n")}
+  n_length <- nrow(data)
 
   ###SHIFT
   if(any(shift > 0) & length(shift)==n_feat)
@@ -115,11 +114,11 @@ lambdaTS <- function(data, target, future, past = future, ci = 0.8, deriv = 1, y
   train_index <- 1:floor(n_length * (1-holdout))
   val_index <- setdiff(1:n_length, train_index)
 
-  if((length(train_index) + min_set - 1) < (past + future) | (length(val_index) + min_set - 1) < (past + future))
+  if((length(train_index) - min_set + 1) < (past + future) | (length(val_index) - min_set + 1) < (past + future))
   {
     message("insufficient data points for the forecasting horizon\n")
     past <- min(c(length(train_index), length(val_index))) - future - (min_set - 1)
-    if(past >= 1){message("setting past to max possible value,", past,"points, for a minimal", min_set ,"validation sequences\n")}
+    if(past >= 1){message("setting past to max possible value, ", past," points, for a minimal ", min_set ," validation sequences\n")}
     if(past < 1){stop("need to reset both past and future parameters or adjust holdout\n")}
   }
 
@@ -161,13 +160,13 @@ lambdaTS <- function(data, target, future, past = future, ci = 0.8, deriv = 1, y
   if(yjt==TRUE)
   {
     melt <- map(smart_split(x_train, along = 3), ~ unique(as.vector(.x)))
-    yj_pars <-  map(melt, ~ yeojohnson(.x))
 
-    x_train <- abind(map2(yj_pars, smart_split(x_train, along = 3), ~ predict(.x, .y)), along = 3)
-    y_train <- abind(map2(yj_pars, smart_split(y_train, along = 3), ~ predict(.x, .y)), along = 3)
-    x_val <- abind(map2(yj_pars, smart_split(x_val, along = 3), ~ predict(.x, .y)), along = 3)
-    y_val <- abind(map2(yj_pars, smart_split(y_val, along = 3), ~ predict(.x, .y)), along = 3)
-    new_reframed <- abind(map2(yj_pars, smart_split(new_reframed, along = 3), ~ array(predict(.x, .y), dim = c(1,length(.y),1))), along = 3)
+    yj_pars <-  map(melt, ~ yjt_fun(.x))
+    x_train <- abind(map2(yj_pars, smart_split(x_train, along = 3), ~ .x$predict_yjt(.y)), along = 3)
+    y_train <- abind(map2(yj_pars, smart_split(y_train, along = 3), ~ .x$predict_yjt(.y)), along = 3)
+    x_val <- abind(map2(yj_pars, smart_split(x_val, along = 3), ~ .x$predict_yjt(.y)), along = 3)
+    y_val <- abind(map2(yj_pars, smart_split(y_val, along = 3), ~ .x$predict_yjt(.y)), along = 3)
+    new_reframed <- abind(map2(yj_pars, smart_split(new_reframed, along = 3), ~ array(.x$predict_yjt(.y), dim = c(1,length(.y),1))), along = 3)
 
     message("yeo-johnson transformation\n")
     if(anyNA(x_train)|anyNA(y_train)|anyNA(x_val)|anyNA(y_val)|anyNA(new_reframed)){stop("error in yeo-johnson transformation")}
@@ -194,11 +193,12 @@ lambdaTS <- function(data, target, future, past = future, ci = 0.8, deriv = 1, y
   ###INTEGRATION & YJ BACK-TRANSFORM
   if(yjt==TRUE)
   {
-    pred_train <- abind(map2(yj_pars, smart_split(pred_train, along = 3), ~ predict(.x, newdata = .y, inverse = TRUE)), along = 3)
-    pred_val <- abind(map2(yj_pars, smart_split(pred_val, along = 3), ~ predict(.x, newdata = .y, inverse = TRUE)), along = 3)
-    samp_val <- map(samp_val, ~ abind(map2(yj_pars, smart_split(.x, along = 3), ~ predict(.x, newdata = .y, inverse = TRUE)), along = 3))
-    pred_new <- map(pred_new, ~ abind(map2(yj_pars, smart_split(.x, along = 3), ~ array(predict(.x, newdata = .y, inverse = TRUE), dim = c(1, future, 1))), along = 3))
+    pred_train <- abind(map2(yj_pars, smart_split(pred_train, along = 3), ~ inv_yjt(.y, lambda = .x$lambda, scaled = .x$scaled)), along = 3)
+    pred_val <- abind(map2(yj_pars, smart_split(pred_val, along = 3), ~ inv_yjt(.y, lambda = .x$lambda, scaled = .x$scaled)), along = 3)
+    samp_val <- map(samp_val, ~ abind(map2(yj_pars, smart_split(.x, along = 3), ~ inv_yjt(.y, lambda = .x$lambda, scaled = .x$scaled)), along = 3))
+    pred_new <- map(pred_new, ~ abind(map2(yj_pars, smart_split(.x, along = 3), ~ array(inv_yjt(.y, lambda = .x$lambda, scaled = .x$scaled), dim = c(1, future, 1))), along = 3))
   }
+
 
   if(deriv > 0)
   {
@@ -237,12 +237,37 @@ lambdaTS <- function(data, target, future, past = future, ci = 0.8, deriv = 1, y
   keep_index <- map2(integrated_pred, domains, ~ suppressWarnings(apply(.x, 2, function(x) switch(.y, "pos" = all(x > 0) & all(is.finite(x)), "neg" = all(x < 0) & all(is.finite(x)), "mix" = all(is.finite(x))))))
   integrated_pred <- map2(integrated_pred, keep_index, ~ .x[ , .y, drop=FALSE])
 
-  pred_quantiles <- map(integrated_pred, ~ t(apply(.x, 1, function(x) {round(c(quantile(x, probs = quants, na.rm = TRUE), mean(x, na.rm=TRUE), sd(x, na.rm=TRUE)), 3)})))
-  prediction <- map(pred_quantiles, ~{rownames(.x) <- paste0("t", 1:future); colnames(.x) <- c(q_names, "mean", "sd"); return(.x)})
+  pred_quantiles <- map(integrated_pred, ~ t(apply(.x, 1, function(x) {round(c(min(x, na.rm=T), quantile(x, probs = quants, na.rm = TRUE), max(x, na.rm=T), mean(x, na.rm=TRUE), sd(x, na.rm=TRUE)), 3)})))
+  ecdf_by_time <- map(integrated_pred, ~ apply(.x, 1, ecdf))
+  prediction <- map(pred_quantiles, ~{rownames(.x) <- paste0("t", 1:future); colnames(.x) <- c("min", q_names, "max", "mean", "sd"); return(.x)})
   names(prediction) <- target
 
   ###PREDICTION STATISTICS
-  pred_stats <- pred_statistics(prediction, tail(orig, 1), future, target)
+  avg_iqr_to_range <- round(map_dbl(prediction, ~ mean((.x[,"q75"] - .x[,"q25"])/(.x[,"max"] - .x[,"min"]))), 3)
+  last_to_first_iqr <- round(map_dbl(prediction, ~ (.x[future,"q75"] - .x[future,"q25"])/(.x[1,"q75"] - .x[1,"q25"])), 3)
+  iqr_stats <- as.data.frame(rbind(avg_iqr_to_range, last_to_first_iqr))
+  rownames(iqr_stats) <- c("avg_iqr_to_range", "terminal_iqr_ratio")
+  colnames(iqr_stats) <- target
+
+  avg_risk_ratio <- round(map_dbl(prediction, ~ mean((.x[,"max"] - .x[,"q50"])/(.x[,"q50"] - .x[,"min"]))), 3)
+  last_to_risk_ratio <- round(map_dbl(prediction, ~ ((.x[future,"max"] - .x[future,"q50"])/(.x[future,"q50"] - .x[future,"min"]))/((.x[1,"max"] - .x[1,"q50"])/(.x[1,"q50"] - .x[1,"min"]))), 3)
+  risk_stats <- as.data.frame(rbind(avg_risk_ratio, last_to_risk_ratio))
+  rownames(risk_stats) <- c("avg_risk_ratio", "terminal_risk_ratio")
+  colnames(risk_stats) <- target
+
+  kld_stats <- map(integrated_pred, ~ tryCatch(sequential_kld(.x), error = function(e) c(NA, NA)))
+  kld_stats <- as.data.frame(map(kld_stats, ~.x))
+  rownames(kld_stats) <- c("avg_kl_divergence", "terminal_kl_divergence")
+  colnames(kld_stats) <- target
+
+  upp_stats <- map(integrated_pred, ~ tryCatch(upside_probability(.x), error = function(e) c(NA, NA)))
+  upp_stats <- as.data.frame(map(upp_stats, ~.x))
+  rownames(upp_stats) <- c("avg_upside_prob", "terminal_upside_prob")
+  colnames(upp_stats) <- target
+
+  pred_stats <- rbind(iqr_stats, risk_stats, kld_stats, upp_stats)
+
+  #pred_stats <- pred_statistics(prediction, tail(orig, 1), future, target, ecdf_by_time)
 
   ###TRAINING PLOT
   act_epochs <- length(train_history)

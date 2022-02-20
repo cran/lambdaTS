@@ -12,23 +12,19 @@
 #' @import lubridate
 #' @importFrom scales number
 #' @importFrom narray split
-#' @importFrom stats lm median na.omit quantile
+#' @importFrom stats lm median na.omit quantile density
 #' @importFrom utils head tail
-#'
+#' @importFrom car powerTransform
+
 
 ###SUPPORT
 
-globalVariables(c("train_loss", "val_loss", "x_all", "y_all"))
+globalVariables(c("train_loss", "val_loss", "sequential_kld", "upside_probability"))
 
 nn_mish <- nn_module(
   "nn_mish",
   initialize = function() {self$softplus <- nn_softplus()},
   forward = function(x) {x * torch_tanh(self$softplus(x))})
-
-nn_fts <- nn_module(
-  "nn_fts",
-  initialize = function(t = - 0.001) {self$t <- nn_buffer(t)},
-  forward = function(x) {nnf_leaky_relu(x) * torch_sigmoid(x) + t})
 
 nn_snake <- nn_module(
   "nn_snake",
@@ -67,7 +63,6 @@ nn_activ <- nn_module(
     if(act == "tanhshrink"){self$activ <- nn_tanhshrink()}
     if(act == "hardsigmoid"){self$activ <- nn_hardsigmoid()}
     if(act == "swish"){self$activ <- nn_swish()}
-    if(act == "fts"){self$activ <- nn_fts()}
     if(act == "hardtanh"){self$activ <- nn_hardtanh(min_val, max_val)}
     if(act == "hardshrink"){self$activ <- nn_hardshrink(lambda)}
   },
@@ -105,15 +100,17 @@ nn_attention <- nn_module(
   "nn_attention",
   initialize = function(k_embed, r_proj, dev)
   {
+    #self$linear_Q <- nn_linear(k_embed, r_proj)$to(device = dev)
     self$linear_K <- nn_linear(k_embed, r_proj)$to(device = dev)
     self$linear_V <- nn_linear(k_embed, r_proj)$to(device = dev)
     self$softmax <- nn_softmax(dim = -1)
   },
   forward = function(x)
   {
-    #k_embed <- torch_tensor(dim(x)[4], dtype = torch_float32(), device = dev)
+    #Q <- self$linear_K(x)
     K <- self$linear_K(x) #(n, seq, feat, k)
     V <- self$linear_V(x)
+
     attn <- torch_matmul(torch_transpose(self$softmax(K), 3, 2), torch_transpose(torch_transpose(V, 3, 2), 4, 3))
     return(torch_transpose(attn, 4, 2))
   })
@@ -140,19 +137,20 @@ nn_variational_parameter <- nn_module(
   initialize = function(target_len, seq_len, k_embed, r_proj, n_heads, activ, dev)
   {
     self$embedding <- nn_time2vec(seq_len, k_embed, dev)
-    self$attention <- nn_multi_attention(n_heads, k_embed, r_proj, dev)
-    self$target <- nn_linear(seq_len, target_len)$to(device = dev)
-    self$focus <- nn_linear(seq_len * n_heads, 1)$to(device = dev)
+    self$multi_attention <- nn_multi_attention(n_heads, k_embed, r_proj, dev)
+    self$target <- nn_linear(seq_len * n_heads, target_len)$to(device = dev)
+    self$focus <- nn_linear(seq_len, 1)$to(device = dev)
     self$activ <- nn_activ(act = activ)
+    self$norm <- nn_batch_norm2d(seq_len * n_heads)
   },
 
   forward = function(x)
   {
     par <- self$embedding(x)
-    par <- self$attention(par)
-    par <- self$target(torch_transpose(par, 4, 3))
+    par <- self$multi_attention(par)
+    par <- self$target(torch_transpose(par, 4, 2))
     par <- self$activ(par)
-    par <- torch_transpose(par, 4, 2)
+    par <- torch_transpose(torch_transpose(par, 4, 2), 4, 3)
     par <- self$focus(par)
     par <- self$activ(par)
     par <- torch_squeeze(par, 4)
@@ -209,7 +207,7 @@ crps_loss <- function(actual, latent, latent_list, mean_list, scale_list, dev)
 
 elbo_loss <- function(actual, latent, latent_list, mean_list, scale_list, dev)
 {
-  ###EVIDENCE LOWER BOUND (ELSBO)
+  ###EVIDENCE LOWER BOUND (ELBO)
   recon <- nnf_l1_loss(input = latent, target = actual, reduction = "none")
 
   latent_pdf <- Reduce("+", pmap(list(latent_list, mean_list, scale_list), ~ dnorm(as_array(..1$cpu()), mean = as_array(..2$cpu()), sd = as_array(..3$cpu()), log = FALSE)))
@@ -349,6 +347,10 @@ eval_metrics <- function(actual, predicted)
   predicted <- unlist(predicted)
   if(length(actual) != length(predicted)){stop("different lengths")}
 
+  index <- is.finite(actual) & is.finite(predicted)
+  actual <- actual[index]
+  predicted <- predicted[index]
+
   rmse <- sqrt(mean((actual - predicted)^2))
   mae <- mean(abs(actual - predicted))
   mdae <- median(abs(actual - predicted))
@@ -364,13 +366,13 @@ eval_metrics <- function(actual, predicted)
 
 ###
 
-pred_statistics <- function(list_of_predictions, reference_points, future, target)
+pred_statistics <- function(list_of_predictions, reference_points, future, target, ecdf_by_time)
 {
-  average_iqr <- round(map_dbl(list_of_predictions, ~ mean((.x[,"q75"] - .x[,"q25"]))), 3)
-  iqr_ratio <- round(map_dbl(list_of_predictions, ~ (.x[future,"q75"] - .x[future,"q25"])/(.x[1,"q75"] - .x[1,"q25"])), 3)
-  upside_prob <- unlist(map2(list_of_predictions, reference_points, ~ mean(mapply(function(f) (1 - pnorm(.y, .x[f, "mean"], .x[f, "sd"])), f = 1:future))))
-  pred_stats <- round(rbind(average_iqr, iqr_ratio, upside_prob), 4)
-  rownames(pred_stats) <- c("average_iqr", "iqr_ratio", "upside_prob")
+  iqr_to_range <- round(map_dbl(list_of_predictions, ~ mean((.x[,"q75"] - .x[,"q25"])/(.x[,"max"] - .x[,"min"]))), 3)
+  dynamic_iqr_ratio <- round(map_dbl(list_of_predictions, ~ (.x[future,"q75"] - .x[future,"q25"])/(.x[1,"q75"] - .x[1,"q25"])), 3)
+  upside_prob <- unlist(map2(reference_points, ecdf_by_time, ~ mean(mapply(function(f) (1 - ..2[[f]](..1)), f = 1:future))))
+  pred_stats <- round(rbind(iqr_to_range, dynamic_iqr_ratio, upside_prob), 4)
+  rownames(pred_stats) <- c("iqr_to_range", "dynamic_iqr_ratio", "upside_prob")
   colnames(pred_stats) <- target
 
   return(pred_stats)
@@ -459,9 +461,9 @@ ts_graph <- function(x_hist, y_hist, x_forcat, y_forcat, lower = NULL, upper = N
 
   if(!is.null(lower) & !is.null(upper)){forcat_data$lower <- lower; forcat_data$upper <- upper}
 
-  plot <- ggplot()+geom_line(data = all_data, aes(x = x_all, y = y_all), color = hist_line, size = line_size)
-  if(!is.null(lower) & !is.null(upper)){plot <- plot + geom_ribbon(data = forcat_data, aes(x = x_forcat, ymin = lower, ymax = upper), alpha = 0.3, fill = forcat_band)}
-  plot <- plot + geom_line(data = forcat_data, aes(x = x_forcat, y = y_forcat), color = forcat_line, size = line_size)
+  plot <- ggplot()+geom_line(data = all_data, aes_string(x = "x_all", y = "y_all"), color = hist_line, size = line_size)
+  if(!is.null(lower) & !is.null(upper)){plot <- plot + geom_ribbon(data = forcat_data, aes_string(x = "x_forcat", ymin = "lower", ymax = "upper"), alpha = 0.3, fill = forcat_band)}
+  plot <- plot + geom_line(data = forcat_data, aes_string(x = "x_forcat", y = "y_forcat"), color = forcat_line, size = line_size)
   if(!is.null(dbreak)){plot <- plot + scale_x_date(name = paste0("\n", label_x), date_breaks = dbreak, date_labels = date_format)}
   if(is.null(dbreak)){plot <- plot + xlab(label_x)}
   plot <- plot + scale_y_continuous(name = paste0(label_y, "\n"), labels = number)
@@ -469,4 +471,92 @@ ts_graph <- function(x_hist, y_hist, x_forcat, y_forcat, lower = NULL, upper = N
   plot <- plot + theme(axis.text=element_text(size=label_size), axis.title=element_text(size=label_size + 2))
 
   return(plot)
+}
+
+
+###
+yjt_fun <- function(x)
+{
+  yjt <- vector(mode = "numeric", length = length(x))
+  scaled <- scale(x)
+  x <- as.vector(scaled)
+  lambda <- powerTransform(lm(x ~ 1, data.frame(x)), family="yjPower")$lambda
+
+  predict_yjt <- function(x)
+  {
+  yjt <- vector(mode = "numeric", length = length(x))
+  dim(yjt) <- dim(x)
+
+  for(i in 1:length(x))
+  {
+    if(x[i] >= 0 & lambda != 0){yjt[i] <- ((x[i]+1)^lambda - 1)/lambda}
+    if(x[i] >= 0 & lambda == 0){yjt[i] <- log(x[i]+1)}
+    if(x[i] < 0 & lambda != 2){yjt[i] <- -((-x[i]+1)^(2 - lambda) - 1)/(2 - lambda)}
+    if(x[i] < 0 & lambda == 2){yjt[i] <- -log(-x[i]+1)}
+  }
+  return(yjt)
+  }
+
+  out <- list(lambda = lambda, scaled = scaled, predict_yjt = predict_yjt)
+  return(out)
+}
+
+###
+inv_yjt <- function(x, lambda, scaled)
+{
+  inv_yjt <- vector(mode = "numeric", length = length(x))
+  dim(inv_yjt) <- dim(x)
+
+  for(i in 1:length(x))
+  {
+    if(x[i] >= 0 & lambda != 0){inv_yjt[i] <- exp(log(x[i] * lambda + 1)/lambda) - 1}
+    if(x[i] >= 0 & lambda == 0){inv_yjt[i] <- exp(x[i]) - 1}
+    if(x[i] < 0 & lambda != 2){inv_yjt[i] <- 1 - exp(log(1 - x[i]*(2 - lambda))/(2 - lambda))}
+    if(x[i] < 0 & lambda == 2){inv_yjt[i] <- 1 - exp(-x[i])}
+  }
+
+  rescaled <- inv_yjt * attr(scaled, 'scaled:scale') + attr(scaled, 'scaled:center')
+
+  return(rescaled)
+}
+
+###
+sequential_kld <- function(m)
+{
+  matrix <- as.matrix(m)
+  n <- nrow(matrix)
+  if(n == 1){return(NA)}
+  dens <- apply(matrix, 1, function(x) tryCatch(density(x[is.finite(x)], from = min(matrix[is.finite(matrix)]), to = max(matrix[is.finite(matrix)])), error = function(e) NA))
+  backward <- dens[-n]
+  forward <- dens[-1]
+
+  finite_index <- map2(forward, backward, ~ is.finite(log(.x$y/.y$y)) & is.finite(.x$y))
+  seq_kld <- pmap_dbl(list(forward, backward, finite_index), ~ sum(..1$y[..3] * log(..1$y/..2$y)[..3]))
+  avg_seq_kld <- round(mean(seq_kld), 3)
+
+  ratios <- log(dens[[n]]$y/dens[[1]]$y)
+  finite_index <- is.finite(ratios)
+
+  end_to_end_kld <- dens[[n]]$y * log(dens[[n]]$y/dens[[1]]$y)
+  end_to_end_kld <- tryCatch(round(sum(end_to_end_kld[finite_index]), 3), error = function(e) NA)
+  kld_stats <- rbind(avg_seq_kld, end_to_end_kld)
+
+  return(kld_stats)
+}
+
+###
+upside_probability <- function(m)
+{
+  matrix <- as.matrix(m)
+  n <- nrow(matrix)
+  if(n == 1){return(NA)}
+  growths <- matrix[-1,]/matrix[-n,] - 1
+  dens <- apply(growths, 1, function(x) tryCatch(density(x[is.finite(x)], from = min(x[is.finite(x)]), to = max(x[is.finite(x)])), error = function(e) NA))
+  not_na <- !is.na(dens)
+  avg_upp <- tryCatch(round(mean(map_dbl(dens[not_na], ~ sum(.x$y[.x$x>0])/sum(.x$y))), 3), error = function(e) NA)
+  end_growth <- matrix[n,]/matrix[1,] - 1
+  end_to_end_dens <- tryCatch(density(end_growth[is.finite(end_growth)], from = min(end_growth[is.finite(end_growth)]), to = max(end_growth[is.finite(end_growth)])), error = function(e) NA)
+  if(class(end_to_end_dens) == "density"){last_to_first_upp <- round(sum(end_to_end_dens$y[end_to_end_dens$x>0])/sum(end_to_end_dens$y), 3)} else {last_to_first_upp <- NA}
+  upp_stats <- rbind(avg_upp, last_to_first_upp)
+  return(upp_stats)
 }

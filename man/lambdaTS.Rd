@@ -53,7 +53,7 @@ lambdaTS(
 
 \item{yjt}{Logical. Performing Yeo-Johnson Transformation on data is always advisable, especially when dealing with different ts at different scales. Default: TRUE}
 
-\item{shift}{Vector of positive integers. Allow for target variables to shift ahead of time. Zero means no shift. Length must be equal to the number of targets.}
+\item{shift}{Vector of positive integers. Allow for target variables to shift ahead of time. Zero means no shift. Length must be equal to the number of targets. Default: 0.}
 
 \item{smoother}{Logical. Perform optimal smooting using standard loess. Default: FALSE}
 
@@ -63,7 +63,7 @@ lambdaTS(
 
 \item{n_heads}{Positive integer. Number of heads for the attention mechanism. Computationally expensive, use with care. Default: 1}
 
-\item{n_bases}{Positive integer. Number of normal curves to build on each parameter. WIth more than one base you can model be Default: 1}
+\item{n_bases}{Positive integer. Number of normal curves to build on each parameter. Computationally expensive, use with care. Default: 1}
 
 \item{activ}{String. The activation function for the linear transformation of the attention matrix into the future sequence. Implemented options are: "linear", "leaky_relu", "celu", "elu", "gelu", "selu", "softplus", "bent", "snake", "softmax", "softmin", "softsign", "sigmoid", "tanh", "tanhshrink", "swish", "hardtanh", "mish". Default: "linear".}
 
@@ -75,7 +75,7 @@ lambdaTS(
 
 \item{lr}{Positive numeric. Learning rate. Default: 0.01.}
 
-\item{patience}{Positive integer. Waiting time (in epochs) before evaluating the overfit performance.}
+\item{patience}{Positive integer. Waiting time (in epochs) before evaluating the overfit performance. Default: epochs.}
 
 \item{verbose}{Logical. Default: TRUE}
 
@@ -103,9 +103,9 @@ This function returns a list including:
 \item prediction: a table with quantile predictions, mean and std for each ts
 \item history: plot of loss during the training process for the joint-transformed ts
 \item plot: graph with history and prediction for each ts
-\item learning_error: errors for the joint-transformed ts (rmse, mae, mdae, mpe, mape, smape, rrse, rae)
-\item feature_errors: errors for each ts (rmse, mae, mdae, mpe, mape, smape, rrse, rae)
-\item pred_stats: some stats on predicted ts (average iqr, iqr ratio t/1, approx upside probability)
+\item learning_error: errors for the joint-ts in the transformed scale (rmse, mae, mdae, mpe, mape, smape, rrse, rae)
+\item feature_errors: errors for each ts in the original scale (rmse, mae, mdae, mpe, mape, smape, rrse, rae)
+\item pred_stats: for each predicted time feature, IQR to range, KL-divergence, risk ratio, upside probability, averaged across time-points and compared at the terminal points.
 \item time_log
 }
 }
@@ -114,7 +114,7 @@ Time series analysis based on Lambda Transformer and Variational Seq2Seq, built 
 }
 \examples{
 \dontrun{
-lambdaTS(bitcoin_gold_oil, c("bitcoin_Close", "gold_close", "oil_Close"), 30, 30, deriv = 2)
+lambdaTS(bitcoin_gold_oil, c("gold_close", "oil_Close"), 30, deriv = 1)
 }
 
 }
